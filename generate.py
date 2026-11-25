@@ -1,373 +1,423 @@
 #!/usr/bin/env python3
-"""Deterministic generator for the news-image-20261125 entry.
+"""THE WORLD TODAY — front page for Wednesday 25 November 2026.
 
-Draws a one-page newspaper front page, "THE WORLD TODAY", summing up
-Wednesday 25 November 2026 from six verified wire stories. The page is
-composed with Pillow: flat shapes and DejaVu fonts for every panel, plus
-one generated illustration (lead-art.png, made for this entry) cropped
-into the lead panel. No network, no randomness. Running it twice writes
-byte-identical PNGs.
+Draws a one-page newspaper (1024x1024 PNG) with Pillow and DejaVu fonts.
+Everything is fixed: fixed copy, fixed geometry, no randomness, no clock,
+no network — so two runs write byte-identical files.
+
+Layout, top to bottom:
+  * masthead + dateline
+  * lead story: photo on the left, text on the right
+  * a three-story row, then a two-story row, each with a small drawn motif
+  * footer line
+
+Run:  python3 generate.py        (writes entry.png next to this file)
 """
 
-import hashlib
-import os
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-W = H = 1024
-HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "entry.png")
-LEAD_ART = os.path.join(HERE, "lead-art.png")
+# ---------------------------------------------------------------- constants
 
-PAPER = (248, 243, 230)
-INK = (18, 18, 18)
-RED = (178, 34, 34)
-GREY = (90, 88, 80)
-RULE = (40, 40, 40)
+PAGE = 1024
+PAPER = (245, 239, 221)      # warm newsprint
+INK = (20, 18, 16)           # near-black
+RED = (164, 31, 31)          # kicker red
+GREY = (110, 103, 90)        # footer grey
+NAVY = (13, 24, 48)          # dark strip background
+STEEL = (22, 50, 79)         # sea blue
+CREAM = (251, 247, 234)      # light panel
+SAND = (243, 234, 210)       # motif panel
 
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
-SERIF_B = os.path.join(FONT_DIR, "DejaVuSerif-Bold.ttf")
-SERIF = os.path.join(FONT_DIR, "DejaVuSerif.ttf")
-SANS_B = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
-SANS = os.path.join(FONT_DIR, "DejaVuSans.ttf")
+FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 
-
-def font(path, size):
-    return ImageFont.truetype(path, size)
+# ---------------------------------------------------------------- fonts
 
 
-def wrap_text(text, fnt, max_width):
-    """Greedy word wrap using the font's real metrics."""
-    words = text.split()
-    lines, current = [], ""
-    for word in words:
-        trial = f"{current} {word}".strip()
-        if fnt.getlength(trial) <= max_width:
-            current = trial
-        else:
-            if current:
+def face(name, size):
+    """Load one DejaVu face; fall back to the built-in bitmap font."""
+    for candidate in (FONT_DIR / name, Path("/usr/share/fonts") / name):
+        try:
+            return ImageFont.truetype(str(candidate), size)
+        except (OSError, ValueError):
+            continue
+    return ImageFont.load_default(size)
+
+
+def serif_bold(size):
+    return face("DejaVuSerif-Bold.ttf", size)
+
+
+def serif(size):
+    return face("DejaVuSerif.ttf", size)
+
+
+def sans(size):
+    return face("DejaVuSans.ttf", size)
+
+
+def sans_bold(size):
+    return face("DejaVuSans-Bold.ttf", size)
+
+
+def sans_oblique(size):
+    try:
+        return ImageFont.truetype(str(FONT_DIR / "DejaVuSans-Oblique.ttf"), size)
+    except (OSError, ValueError):
+        return sans(size)
+
+
+# ---------------------------------------------------------------- text tools
+
+
+def wrap(draw, text, font, width):
+    """Greedy word wrap; returns a list of lines that fit `width`."""
+    lines = []
+    for chunk in text.split("\n"):
+        words = chunk.split()
+        if not words:
+            lines.append("")
+            continue
+        current = words[0]
+        for word in words[1:]:
+            trial = current + " " + word
+            if draw.textlength(trial, font=font) <= width:
+                current = trial
+            else:
                 lines.append(current)
-            current = word
-    if current:
+                current = word
         lines.append(current)
     return lines
 
 
-def draw_lines(draw, x, y, lines, fnt, fill, leading):
+def fitted(draw, text, font, width, max_lines, floor=11):
+    """Wrap `text`; shrink the font until it fits `max_lines` lines.
+
+    Returns (lines, font). Deterministic: pure function of the inputs.
+    """
+    size = font.size
+    while size > floor:
+        lines = wrap(draw, text, font, width)
+        if len(lines) <= max_lines:
+            return lines, font
+        size -= 1
+        font = ImageFont.truetype(font.path, size) if hasattr(font, "path") else font
+        # Rebuild from the same family: truetype keeps .path; bitmap lacks it.
+        if not hasattr(font, "path"):
+            break
+    return wrap(draw, text, font, width), font
+
+
+def draw_lines(draw, x, y, lines, font, fill, leading):
+    """Draw stacked lines; returns the y just below the last line."""
+    top = y
     for line in lines:
-        draw.text((x, y), line, font=fnt, fill=fill)
-        y += leading
-    return y
+        draw.text((x, top), line, font=font, fill=fill)
+        top += leading
+    return top
 
 
-def fit_lines(text, fnt, max_width, max_lines):
-    """Wrap text and fail loudly if it would overflow its box."""
-    lines = wrap_text(text, fnt, max_width)
-    if len(lines) > max_lines:
-        raise ValueError(f"text overflows ({len(lines)} > {max_lines}): {text!r}")
-    return lines
+def rule(draw, x0, x1, y, weight=1, fill=INK):
+    """Horizontal rule from x0 to x1 (inclusive)."""
+    draw.line([(x0, y), (x1, y)], fill=fill, width=weight)
 
 
-def rule(draw, x0, y, x1, width=2):
-    draw.line([(x0, y), (x1, y)], fill=RULE, width=width)
+def cover_crop(img, target_w, target_h):
+    """Centre-crop `img` to the target aspect, then resize to it."""
+    src_w, src_h = img.size
+    want = target_w / target_h
+    have = src_w / src_h
+    if have > want:  # too wide: trim the sides
+        cut_w = int(src_h * want)
+        left = (src_w - cut_w) // 2
+        box = (left, 0, left + cut_w, src_h)
+    else:  # too tall: trim top and bottom
+        cut_h = int(src_w / want)
+        top = (src_h - cut_h) // 2
+        box = (0, top, src_w, top + cut_h)
+    return img.crop(box).resize((target_w, target_h), Image.LANCZOS)
+
+# ---------------------------------------------------------------- motifs
+
+import math
+
+# Each painter draws one small strip inside the box (x, y, w, h).
+# All shapes are plain Pillow primitives with fixed coordinates, so the
+# result is identical on every run.
 
 
-def kicker_headline(draw, x, y, width, kicker, headline, head_font,
-                    head_leading, kicker_font):
-    draw.text((x, y), kicker, font=kicker_font, fill=RED)
-    y += 24
-    lines = fit_lines(headline, head_font, width, 3)
-    y = draw_lines(draw, x, y, lines, head_font, INK, head_leading)
-    return y
+def paint_chart(draw, x, y, w, h):
+    """Falling market line with candlesticks."""
+    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=CREAM, outline=INK, width=1)
+    deep = (120, 20, 20)
+    pts = [
+        (x + 14, y + 12),
+        (x + w // 4, y + 18),
+        (x + w // 2, y + 26),
+        (x + 3 * w // 4, y + 34),
+        (x + w - 16, y + h - 16),
+    ]
+    draw.line(pts, fill=RED, width=3, joint="curve")
+    for i, px in enumerate((x + w // 5, x + 2 * w // 5, x + 3 * w // 5, x + 4 * w // 5)):
+        top = y + 12 + i * 6
+        draw.line([(px, top - 6), (px, top + 16)], fill=deep, width=1)
+        draw.rectangle([px - 4, top, px + 4, top + 10], fill=deep)
+    ex, ey = x + w - 16, y + h - 16
+    draw.polygon([(ex, ey), (ex - 12, ey - 6), (ex - 12, ey + 6)], fill=RED)
 
 
-def paste_lead_art(draw, img, x, y, w, h):
-    """Centre-crop the generated lead illustration into its panel."""
-    art = Image.open(LEAD_ART).convert("RGB")
-    aw, ah = art.size
-    target = w / h
-    if aw / ah > target:
-        nw = int(ah * target)
-        off = (aw - nw) // 2
-        art = art.crop((off, 0, off + nw, ah))
-    else:
-        nh = int(aw / target)
-        off = (ah - nh) // 2
-        art = art.crop((0, off, aw, off + nh))
-    art = art.resize((w, h), Image.LANCZOS)
-    img.paste(art, (x, y))
-    draw.rectangle([x, y, x + w - 1, y + h - 1], outline=INK, width=2)
+def paint_ship(draw, x, y, w, h):
+    """Warship on a dark sea, blast star on the horizon."""
+    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=STEEL, outline=INK, width=1)
+    hull = (12, 12, 16)
+    base = y + h - 16
+    draw.polygon(
+        [
+            (x + 14, base - 14),
+            (x + w - 60, base - 14),
+            (x + w - 34, base),
+            (x + 22, base),
+        ],
+        fill=hull,
+    )
+    draw.rectangle([x + w // 3, base - 26, x + w // 3 + 34, base - 14], fill=hull)
+    draw.rectangle([x + w // 3 + 8, base - 34, x + w // 3 + 18, base - 26], fill=hull)
+    draw.line([(x + w // 3 + 13, base - 34), (x + w // 3 + 13, base - 44)], fill=hull, width=2)
+    star_cx, star_cy = x + w - 52, y + 18
+    star = []
+    for k in range(8):
+        ang = k * math.pi / 4
+        r = 13 if k % 2 == 0 else 5
+        star.append((star_cx + r * math.cos(ang), star_cy + r * math.sin(ang)))
+    draw.polygon(star, fill=(255, 190, 40))
+    draw.ellipse([x + w - 30, y + 10, x + w - 14, y + 26], fill=(230, 110, 40))
 
 
-# ---------------------------------------------------------------------------
-# Flat illustrations: one small scene per story, drawn from rectangles,
-# ellipses and polygons only. Each is drawn fresh for this entry.
-# All coordinates are relative to the panel origin (x, y).
-# ---------------------------------------------------------------------------
-
-def art_chart(draw, x, y, w, h):
-    """A falling market chart: red line diving down over candlesticks."""
-    draw.rectangle([x, y, x + w, y + h], fill=(238, 234, 224))
-    # faint horizontal gridlines
-    for gy in (y + 14, y + 28, y + 42):
-        draw.line([(x + 8, gy), (x + w - 8, gy)], fill=(210, 204, 190), width=1)
-    # candlesticks, alternating down
-    for i, (cx, top, bot) in enumerate([(40, 10, 26), (110, 16, 34),
-                                        (180, 22, 40), (250, 30, 46),
-                                        (320, 36, 50), (390, 42, 54)]):
-        col = RED if i % 2 == 0 else (120, 40, 40)
-        draw.line([(x + cx + 6, y + top - 4), (x + cx + 6, y + bot + 4)],
-                  fill=col, width=2)
-        draw.rectangle([x + cx, y + top, x + cx + 12, y + bot], fill=col)
-    # red line diving from top-left to bottom-right
-    pts = [(x + 12, y + 6), (x + 90, y + 12), (x + 170, y + 24),
-           (x + 250, y + 30), (x + 330, y + 44), (x + w - 16, y + 50)]
-    draw.line(pts, fill=RED, width=4, joint="curve")
-    ax, ay = pts[-1]
-    draw.polygon([(ax - 12, ay - 8), (ax + 4, ay), (ax - 12, ay + 8)],
-                 fill=RED)
+def paint_derrick(draw, x, y, w, h):
+    """Oil derrick, smoke puffs, low sun."""
+    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=SAND, outline=INK, width=1)
+    brown = (96, 62, 36)
+    apex = (x + w // 4, y + 8)
+    foot_l = (x + 14, y + h - 8)
+    foot_r = (x + w // 2, y + h - 8)
+    draw.line([apex, foot_l], fill=brown, width=3)
+    draw.line([apex, foot_r], fill=brown, width=3)
+    for t in (0.35, 0.65):
+        ax = apex[0] + (foot_l[0] - apex[0]) * t
+        ay = apex[1] + (foot_l[1] - apex[1]) * t
+        bx = apex[0] + (foot_r[0] - apex[0]) * t
+        by = apex[1] + (foot_r[1] - apex[1]) * t
+        draw.line([(ax, ay), (bx, by)], fill=brown, width=2)
+    draw.line([(x + 8, y + h - 8), (x + w - 8, y + h - 8)], fill=brown, width=2)
+    for cx, cy, r in (
+        (x + w // 2 + 16, y + 12, 9),
+        (x + w // 2 + 32, y + 18, 11),
+        (x + w // 2 + 48, y + 12, 8),
+    ):
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(150, 148, 142))
+    draw.ellipse([x + w - 44, y + 8, x + w - 16, y + 36], fill=(235, 140, 40))
+    draw.rectangle([x + w - 66, y + h - 26, x + w - 46, y + h - 8], fill=(140, 30, 30))
 
 
-def art_warship(draw, x, y, w, h):
-    """A warship at sea with an orange blast flash on the horizon."""
-    draw.rectangle([x, y, x + w, y + h], fill=(36, 84, 120))
-    # sun low on the horizon
-    draw.ellipse([x + w - 60, y + 6, x + w - 28, y + 38],
-                 fill=(226, 120, 60))
-    # blast flash, right of centre
-    bx, by = x + w - 130, y + 12
-    draw.polygon([(bx, by - 8), (bx + 8, by + 2), (bx + 20, by - 4),
-                  (bx + 12, by + 8), (bx + 22, by + 14), (bx + 4, by + 14),
-                  (bx - 2, by + 24), (bx - 8, by + 10), (bx - 20, by + 12),
-                  (bx - 10, by + 2)], fill=(240, 190, 60))
-    # smoke above the blast
-    for cx, cy, r in [(bx - 6, by - 12, 7), (bx + 6, by - 16, 6)]:
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(120, 112, 104))
-    # warship hull, lower left
-    draw.polygon([(x + 20, y + h - 14), (x + 210, y + h - 14),
-                  (x + 196, y + h - 2), (x + 34, y + h - 2)],
-                 fill=(24, 34, 44))
-    draw.rectangle([x + 60, y + h - 28, x + 96, y + h - 14],
-                   fill=(24, 34, 44))
-    draw.rectangle([x + 120, y + h - 24, x + 132, y + h - 14],
-                   fill=(24, 34, 44))
-    # wake lines
-    draw.line([(x + 20, y + h - 4), (x + 220, y + h - 4)],
-              fill=(150, 200, 225), width=2)
+def paint_shop(draw, x, y, w, h):
+    """Corner shop at night under police lights."""
+    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=NAVY, outline=INK, width=1)
+    # Shopfront on the left half: tall striped awning, cream wall,
+    # dark door on the left, wide lit window on the right.
+    shop_x0 = x + 14
+    shop_w = int(w * 0.52)
+    aw_top, aw_bot = y + 6, y + 22
+    stripe = 14
+    sx = shop_x0
+    on = True
+    while sx < shop_x0 + shop_w:
+        fill = RED if on else CREAM
+        draw.rectangle([sx, aw_top, min(sx + stripe, shop_x0 + shop_w) - 1, aw_bot], fill=fill)
+        sx += stripe
+        on = not on
+    draw.rectangle([shop_x0, aw_top, shop_x0 + shop_w, aw_bot], outline=INK, width=1)
+    draw.rectangle([shop_x0, aw_bot, shop_x0 + shop_w, y + h - 4], fill=CREAM, outline=INK, width=1)
+    door_w = shop_w // 3
+    draw.rectangle(
+        [shop_x0 + 6, y + 30, shop_x0 + 6 + door_w, y + h - 4],
+        fill=(38, 44, 66),
+        outline=INK,
+        width=1,
+    )
+    win_x0 = shop_x0 + 6 + door_w + 6
+    win_x1 = shop_x0 + shop_w - 6
+    draw.rectangle([win_x0, y + 30, win_x1, y + h - 12], fill=(70, 90, 130), outline=INK, width=1)
+    draw.line([(win_x0, y + 38), (win_x1, y + 38)], fill=CREAM, width=2)
+    # Police beacons on the right: red and blue lights with halos.
+    cy = y + h // 2
+    for cx, core, halo in (
+        (x + w - 108, (220, 60, 60), (120, 40, 40)),
+        (x + w - 68, (80, 140, 255), (40, 70, 150)),
+    ):
+        draw.ellipse([cx - 16, cy - 12, cx + 16, cy + 12], fill=halo)
+        draw.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=core)
 
 
-def art_oil(draw, x, y, w, h):
-    """A desert oil derrick under a hazy sun, grey cloud overhead."""
-    draw.rectangle([x, y, x + w, y + h], fill=(238, 226, 200))
-    # hazy sun
-    draw.ellipse([x + w - 56, y + 6, x + w - 24, y + 38],
-                 fill=(240, 190, 60))
-    # grey cloud, mid-panel
-    for cx, cy, r in [(200, 12, 12), (220, 8, 10), (240, 12, 11)]:
-        draw.ellipse([x + cx - r, y + cy - r, x + cx + r, y + cy + r],
-                     fill=(150, 144, 134))
-    # ground line
-    draw.line([(x, y + h - 12), (x + w, y + h - 12)], fill=(120, 100, 70),
-              width=2)
-    # oil derrick (A-frame), left-centre
-    ax = x + 90
-    draw.line([(ax - 34, y + h - 12), (ax, y + 6)], fill=(70, 66, 60), width=3)
-    draw.line([(ax + 34, y + h - 12), (ax, y + 6)], fill=(70, 66, 60), width=3)
-    draw.line([(ax - 22, y + h - 26), (ax + 22, y + h - 26)],
-              fill=(70, 66, 60), width=2)
-    draw.line([(ax - 12, y + h - 38), (ax + 12, y + h - 38)],
-              fill=(70, 66, 60), width=2)
-    # oil barrel, right
-    draw.rectangle([x + w - 120, y + h - 34, x + w - 84, y + h - 12],
-                   fill=(122, 44, 34))
-    draw.line([(x + w - 120, y + h - 27), (x + w - 84, y + h - 27)],
-              fill=(90, 30, 24), width=2)
-    draw.line([(x + w - 120, y + h - 19), (x + w - 84, y + h - 19)],
-              fill=(90, 30, 24), width=2)
-
-
-def art_shop(draw, x, y, w, h):
-    """A shopfront at night under flashing red and blue police lights."""
-    draw.rectangle([x, y, x + w, y + h], fill=(22, 26, 40))
-    # police light bars with glow, top corners
-    draw.rectangle([x + 14, y + 6, x + 58, y + 16], fill=(220, 40, 40))
-    draw.ellipse([x + 20, y + 18, x + 52, y + 26], fill=(240, 120, 120))
-    draw.rectangle([x + w - 58, y + 6, x + w - 14, y + 16],
-                   fill=(50, 90, 220))
-    draw.ellipse([x + w - 52, y + 18, x + w - 20, y + 26],
-                 fill=(120, 150, 240))
-    # shopfront: awning + glass door + window
-    draw.polygon([(x + 120, y + 18), (x + w - 120, y + 18),
-                  (x + w - 100, y + 32), (x + 100, y + 32)],
-                 fill=(178, 34, 34))
-    draw.rectangle([x + 120, y + 32, x + w - 120, y + h - 4],
-                   fill=(240, 226, 200))
-    draw.rectangle([x + 140, y + 40, x + w - 220, y + h - 12],
-                   fill=(70, 90, 110))
-    draw.rectangle([x + w - 200, y + 40, x + w - 140, y + h - 12],
-                   fill=(40, 52, 66))
-    # lit shelves inside the window
-    for sy in (y + 48, y + 60):
-        draw.line([(x + 148, sy), (x + w - 228, sy)], fill=(240, 200, 90),
-                  width=2)
-    # pavement
-    draw.rectangle([x, y + h - 4, x + w, y + h], fill=(60, 60, 66))
-
-
-def art_space(draw, x, y, w, h):
-    """A rocket climbing past stars toward a small space station."""
-    draw.rectangle([x, y, x + w, y + h], fill=(16, 22, 44))
-    # stars
-    for sx, sy in [(18, 12), (60, 26), (110, 10), (160, 22), (30, 60),
-                   (90, 80), (150, 66), (180, 100), (44, 104), (120, 110)]:
-        draw.ellipse([x + sx - 2, y + sy - 2, x + sx + 2, y + sy + 2],
-                     fill=(220, 220, 200))
-    # planet, top right
-    draw.ellipse([x + w - 46, y + 10, x + w - 14, y + 42],
-                 fill=(52, 110, 168))
-    draw.ellipse([x + w - 40, y + 18, x + w - 28, y + 26],
-                 fill=(86, 150, 84))
-    # space station, top left
-    draw.rectangle([x + 16, y + 30, x + 64, y + 40], fill=(200, 200, 210))
-    draw.rectangle([x + 8, y + 32, x + 16, y + 38], fill=(140, 160, 200))
-    draw.rectangle([x + 64, y + 32, x + 72, y + 38], fill=(140, 160, 200))
-    # rocket, centre, nose up
+def paint_rocket(draw, x, y, w, h):
+    """Rocket climbing past Earth and stars."""
+    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=NAVY, outline=INK, width=1)
+    for fx, fy, fr in (
+        (0.08, 0.20, 2), (0.20, 0.70, 2), (0.32, 0.15, 1),
+        (0.55, 0.80, 2), (0.68, 0.25, 1), (0.85, 0.60, 2),
+        (0.92, 0.20, 1), (0.45, 0.45, 1),
+    ):
+        cx, cy = x + int(w * fx), y + int(h * fy)
+        draw.ellipse([cx - fr, cy - fr, cx + fr, cy + fr], fill=(255, 255, 255))
+    ex, ey, er = x + w - 40, y + 22, 15
+    draw.ellipse([ex - er, ey - er, ex + er, ey + er], fill=(52, 110, 190))
+    draw.ellipse([ex - 4, ey - 8, ex + 8, ey + 2], fill=(80, 170, 90))
     rx = x + w // 2
-    draw.polygon([(rx - 10, y + h - 34), (rx + 10, y + h - 34),
-                  (rx + 10, y + h - 66), (rx, y + h - 84),
-                  (rx - 10, y + h - 66)], fill=(240, 238, 230))
-    draw.polygon([(rx - 18, y + h - 34), (rx - 10, y + h - 34),
-                  (rx - 10, y + h - 52)], fill=RED)
-    draw.polygon([(rx + 18, y + h - 34), (rx + 10, y + h - 34),
-                  (rx + 10, y + h - 52)], fill=RED)
-    # flame
-    draw.polygon([(rx - 7, y + h - 34), (rx + 7, y + h - 34),
-                  (rx, y + h - 12)], fill=(240, 140, 40))
-    draw.polygon([(rx - 4, y + h - 34), (rx + 4, y + h - 34),
-                  (rx, y + h - 20)], fill=(240, 200, 90))
+    body_top = y + 10
+    body_bot = y + h - 22
+    draw.polygon([(rx - 8, body_top + 12), (rx, body_top), (rx + 8, body_top + 12)], fill=RED)
+    draw.rectangle([rx - 8, body_top + 12, rx + 8, body_bot], fill=(245, 245, 245))
+    draw.polygon([(rx - 8, body_bot), (rx - 16, body_bot + 8), (rx - 8, body_bot + 4)], fill=RED)
+    draw.polygon([(rx + 8, body_bot), (rx + 16, body_bot + 8), (rx + 8, body_bot + 4)], fill=RED)
+    draw.polygon([(rx - 5, body_bot), (rx + 5, body_bot), (rx, body_bot + 16)], fill=(235, 140, 40))
+    draw.polygon([(rx - 2, body_bot), (rx + 2, body_bot), (rx, body_bot + 9)], fill=(255, 210, 80))
 
-
-# ---------------------------------------------------------------------------
-# Stories: headlines and summaries, every fact verified from live wire
-# reports on 25 November 2026.
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- content
 
 LEAD = {
     "kicker": "IRAN WAR",
     "headline": "MINES HIT TWO TANKERS IN HORMUZ AS WAR WIDENS",
-    "summary": ("Iran's Guards said two tankers hit mines in the Strait "
-                "of Hormuz as a Saudi-led coalition struck Yemen's "
-                "Hodeidah port. Trump warned Tehran of a 'very traumatic' "
-                "outcome if no nuclear deal is reached."),
+    "summary": (
+        "Two tankers hit mines in the Strait of Hormuz, Iran's Guards said, "
+        "as a Saudi-led coalition struck Yemen's Hodeidah port. Trump warned "
+        "Tehran of a 'very traumatic' outcome if no nuclear deal is reached."
+    ),
+    "caption": "Smoke over the Strait of Hormuz as tankers sail on.",
 }
 
-GRID = [
+ROW_THREE = [
     {
         "kicker": "MARKETS",
         "headline": "NVIDIA SLIDES 7% AS AI RALLY FADES",
-        "summary": ("Nvidia fell 7% as lawmakers questioned Trump's "
-                    "role in Huang's return. Nikkei -2.76%."),
-        "art": art_chart,
+        "summary": (
+            "Nvidia fell 7% as lawmakers questioned Trump's role in Huang's "
+            "return. Nikkei -2.76%."
+        ),
+        "motif": paint_chart,
     },
     {
         "kicker": "UKRAINE WAR",
         "headline": "UKRAINE HITS RUSSIAN WARSHIP OFF LIBYA",
-        "summary": ("Ukraine hit a Russian warship off Libya; leaked "
-                    "records put Russian war dead at 720,000."),
-        "art": art_warship,
+        "summary": (
+            "Ukraine hit a Russian warship off Libya; leaked records put "
+            "Russian war dead at 720,000."
+        ),
+        "motif": paint_ship,
     },
     {
         "kicker": "CLIMATE",
         "headline": "OIL STATES KILLED COP31 — NOW WHAT?",
-        "summary": ("After COP31 collapsed, Saudi Arabia and oil states "
-                    "blocked any fossil-fuel phaseout mention."),
-        "art": art_oil,
-    },
-    {
-        "kicker": "COLOMBIA",
-        "headline": "GUNMEN HOLD 20 HOSTAGE IN CARTAGENA SHOP",
-        "summary": ("Armed men held about 20 people hostage in a "
-                    "Cartagena supermarket; a car bomb injured 23."),
-        "art": art_shop,
+        "summary": (
+            "After COP31 collapsed, Saudi Arabia and oil states blocked any "
+            "fossil-fuel phaseout mention."
+        ),
+        "motif": paint_derrick,
     },
 ]
 
-BOTTOM = {
-    "kicker": "SPACE",
-    "headline": "PAKISTAN'S FIRST ASTRONAUT REACHES CHINA'S STATION",
-    "summary": ("Zeeshan Ali became Pakistan's first astronaut aboard "
-                "China's Shenzhou-24 spacecraft, reaching the Tiangong "
-                "space station."),
-}
+ROW_TWO = [
+    {
+        "kicker": "COLOMBIA",
+        "headline": "GUNMEN HOLD 20 HOSTAGE IN CARTAGENA SHOP",
+        "summary": (
+            "Armed men held about 20 people hostage in a Cartagena "
+            "supermarket; a car bomb injured 23."
+        ),
+        "motif": paint_shop,
+    },
+    {
+        "kicker": "SPACE",
+        "headline": "PAKISTAN'S FIRST ASTRONAUT REACHES CHINA'S STATION",
+        "summary": (
+            "Zeeshan Ali became Pakistan's first astronaut aboard China's "
+            "Shenzhou-24 spacecraft, reaching the Tiangong space station."
+        ),
+        "motif": paint_rocket,
+    },
+]
+
+FOOTER = "Compiled from wire reports • 25 November 2026"
 
 
-def build():
-    img = Image.new("RGB", (W, H), PAPER)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([8, 8, W - 9, H - 9], outline=INK, width=3)
+# ---------------------------------------------------------------- assembly
 
-    # Masthead and dateline.
-    mast = font(SERIF_B, 62)
-    title = "THE WORLD TODAY"
-    draw.text(((W - mast.getlength(title)) / 2, 24), title, font=mast, fill=INK)
-    rule(draw, 28, 104, W - 28)
-    date_font = font(SERIF_B, 26)
-    dateline = "WEDNESDAY, 25 NOVEMBER 2026"
-    draw.text(((W - date_font.getlength(dateline)) / 2, 114), dateline,
-              font=date_font, fill=RED)
-    rule(draw, 28, 150, W - 28)
 
-    # Lead story: text left, illustration right.
-    lead_y = 162
-    paste_lead_art(draw, img, 620, lead_y, 376, 232)
-    y = kicker_headline(draw, 28, lead_y, 572, LEAD["kicker"],
-                        LEAD["headline"], font(SERIF_B, 33), 40,
-                        font(SANS_B, 16))
-    y += 6
-    lines = fit_lines(LEAD["summary"], font(SANS, 18), 572, 4)
-    draw_lines(draw, 28, y, lines, font(SANS, 18), INK, 25)
+def centred(draw, y, text, font, fill):
+    """Draw `text` centred on the page at height y."""
+    width = draw.textlength(text, font=font)
+    draw.text(((PAGE - width) / 2, y), text, font=font, fill=fill)
 
-    # Two-by-two grid.
-    rule(draw, 28, 406, W - 28)
-    grid_y = 418
-    cell_w, cell_h = 470, 178
-    for i, story in enumerate(GRID):
-        cx = 28 + (i % 2) * (cell_w + 28)
-        cy = grid_y + (i // 2) * (cell_h + 12)
-        story["art"](draw, cx, cy, cell_w, 56)
-        draw.rectangle([cx, cy, cx + cell_w - 1, cy + 55], outline=INK, width=1)
-        draw.text((cx, cy + 62), story["kicker"], font=font(SANS_B, 15), fill=RED)
-        head_lines = fit_lines(story["headline"], font(SERIF_B, 21), cell_w, 2)
-        draw_lines(draw, cx, cy + 84, head_lines, font(SERIF_B, 21), INK, 25)
-        sum_lines = fit_lines(story["summary"], font(SANS, 16), cell_w, 2)
-        draw_lines(draw, cx, cy + 136, sum_lines, font(SANS, 16), INK, 21)
 
-    # Bottom strip: story six.
-    rule(draw, 28, 812, W - 28)
-    art_space(draw, 28, 826, 200, 130)
-    draw.rectangle([28, 826, 227, 955], outline=INK, width=2)
-    y = kicker_headline(draw, 248, 826, 748, BOTTOM["kicker"],
-                        BOTTOM["headline"], font(SERIF_B, 24), 29,
-                        font(SANS_B, 15))
-    y += 4
-    lines = fit_lines(BOTTOM["summary"], font(SANS, 17), 748, 2)
-    draw_lines(draw, 248, y, lines, font(SANS, 17), INK, 23)
+def draw_masthead(draw):
+    draw.rectangle([10, 10, PAGE - 11, PAGE - 11], outline=INK, width=3)
+    draw.rectangle([18, 18, PAGE - 19, PAGE - 19], outline=INK, width=1)
+    centred(draw, 32, "THE WORLD TODAY", serif_bold(58), INK)
+    rule(draw, 26, PAGE - 27, 102, weight=2)
+    rule(draw, 26, PAGE - 27, 106, weight=1)
+    centred(draw, 114, "WEDNESDAY, 25 NOVEMBER 2026", serif_bold(21), RED)
+    rule(draw, 26, PAGE - 27, 146, weight=1)
 
-    # Footer.
-    foot = font(SANS, 15)
-    footer = "Compiled from wire reports  \u2022  25 November 2026"
-    draw.text(((W - foot.getlength(footer)) / 2, 978), footer, font=foot, fill=GREY)
-    return img
+
+def draw_lead(page, draw, photo):
+    # Photo on the left, caption bar across its foot.
+    art = cover_crop(photo, 526, 304)
+    page.paste(art, (34, 158))
+    draw.rectangle([34, 158, 559, 461], outline=INK, width=1)
+    draw.rectangle([34, 432, 559, 461], fill=NAVY)
+    caption = sans_oblique(13)
+    cw = draw.textlength(LEAD["caption"], font=caption)
+    draw.text((34 + (526 - cw) / 2, 440), LEAD["caption"], font=caption, fill=(245, 245, 245))
+    # Text on the right.
+    tx, tw = 584, 406
+    draw.text((tx, 160), LEAD["kicker"], font=sans_bold(16), fill=RED)
+    lines, font = fitted(draw, LEAD["headline"], serif_bold(36), tw, 3)
+    below = draw_lines(draw, tx, 188, lines, font, INK, 44)
+    slines, sfont = fitted(draw, LEAD["summary"], sans(17), tw, 5)
+    draw_lines(draw, tx, below + 12, slines, sfont, INK, 24)
+
+
+def draw_cell(draw, x, y, width, story, head_size, body_size, body_lines):
+    """One grid story: motif strip, kicker, headline, summary."""
+    story["motif"](draw, x, y, width, 58)
+    draw.text((x, y + 66), story["kicker"], font=sans_bold(14), fill=RED)
+    lines, font = fitted(draw, story["headline"], serif_bold(head_size), width, 2)
+    draw_lines(draw, x, y + 90, lines, font, INK, head_size + 5)
+    slines, sfont = fitted(draw, story["summary"], sans(body_size), width, body_lines)
+    draw_lines(draw, x, y + 148, slines, sfont, INK, body_size + 5)
+
+
+def build_page(photo):
+    page = Image.new("RGB", (PAGE, PAGE), PAPER)
+    draw = ImageDraw.Draw(page)
+    draw_masthead(draw)
+    draw_lead(page, draw, photo)
+    rule(draw, 26, PAGE - 27, 478, weight=2)
+    for i, story in enumerate(ROW_THREE):
+        draw_cell(draw, 34 + i * 322, 494, 310, story, 20, 14, 3)
+    for i, story in enumerate(ROW_TWO):
+        draw_cell(draw, 34 + i * 484, 732, 472, story, 21, 15, 3)
+    rule(draw, 26, PAGE - 27, 970, weight=1)
+    centred(draw, 978, FOOTER, sans(13), GREY)
+    return page
 
 
 def main():
-    img = build()
-    img.save(OUT, format="PNG", optimize=True)
-    size = os.path.getsize(OUT)
-    digest = hashlib.sha256(open(OUT, "rb").read()).hexdigest()
-    print(f"wrote {OUT} ({size} bytes, sha256 {digest})")
-    if size > 1048576:
-        raise SystemExit("entry.png is over the 1 MiB limit")
+    here = Path(__file__).resolve().parent
+    photo = Image.open(here / "lead-art.png").convert("RGB")
+    page = build_page(photo)
+    out = here / "entry.png"
+    page.save(out, format="PNG")
+    print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

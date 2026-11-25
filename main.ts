@@ -1,56 +1,57 @@
-/**
- * news-image-20261125 entry program (Node 22+, standard library only).
- *
- * The newspaper image is built by generate.py and stored in this repo as
- * entry.png (1024x1024, 279,129 bytes, sha256
- * d5fe8a1f0791bafec11c9a015e1f5afcaa77e6fccdaba004992343bdc4a525e2).
- * This program only checks that file and writes it to the
- * output directory make.fun provides, so both graded runs produce
- * identical bytes. It never generates, edits or fetches anything.
- */
+// news-image-20261125 — entrypoint.
+//
+// Copies the pre-rendered front page (entry.png, in this repository)
+// into the output directory after checking it is a well-formed PNG of
+// 1024x1024 pixels and no more than 1 MiB. The program takes no input,
+// reads no network and writes exactly one file, so repeated runs agree.
+//
+// entry.png sha256: a1150638bc71fdf89b48263b0274bb3ab3926a487e4e2c07d64a6fb7fa3517ec
+// entry.png bytes: 368575
 import { copyFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const LIMIT_BYTES = 1_048_576;
-const SIDE = 1024;
+const REPO = dirname(fileURLToPath(import.meta.url));
+const SOURCE = join(REPO, "entry.png");
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "out";
+const TARGET = join(OUT_DIR, "entry.png");
 
-const repoDir = dirname(fileURLToPath(import.meta.url));
-const source = join(repoDir, "entry.png");
-const targetDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const target = join(targetDir, "entry.png");
-
-const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-
-function fail(message) {
-  throw new Error(`entry.png rejected: ${message}`);
+function die(message: string): never {
+  console.error(`entrypoint: ${message}`);
+  process.exit(1);
 }
 
-function validate(bytes, size) {
-  if (size > LIMIT_BYTES) {
-    fail(`is ${size} bytes, over the 1 MiB limit`);
+function sha256Hex(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function checkPng(bytes: Buffer): void {
+  const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (bytes.length < 33 || !bytes.subarray(0, 8).equals(magic)) {
+    die("entry.png is not a PNG file");
   }
-  if (!PNG_MAGIC.every((byte, i) => bytes[i] === byte)) {
-    fail("does not start with the PNG signature");
-  }
-  if (bytes.toString("ascii", 12, 16) !== "IHDR") {
-    fail("has no IHDR chunk");
+  if (bytes.subarray(12, 16).toString("ascii") !== "IHDR") {
+    die("entry.png has no IHDR chunk where one belongs");
   }
   const width = bytes.readUInt32BE(16);
   const height = bytes.readUInt32BE(20);
-  if (width !== SIDE || height !== SIDE) {
-    fail(`is ${width}x${height}, expected ${SIDE}x${SIDE}`);
+  if (width !== 1024 || height !== 1024) {
+    die(`entry.png is ${width}x${height}, expected 1024x1024`);
   }
-  return { width, height };
+  if (bytes.length > 1048576) {
+    die(`entry.png is ${bytes.length} bytes, over the 1 MiB limit`);
+  }
 }
 
-function main() {
-  const bytes = readFileSync(source);
-  const size = statSync(source).size;
-  const { width, height } = validate(bytes, size);
-  mkdirSync(targetDir, { recursive: true });
-  copyFileSync(source, target);
-  console.log(`wrote ${target} (${size} bytes, ${width}x${height})`);
+const input = readFileSync(SOURCE);
+checkPng(input);
+const digest = sha256Hex(input);
+mkdirSync(OUT_DIR, { recursive: true });
+copyFileSync(SOURCE, TARGET);
+const written = readFileSync(TARGET);
+if (sha256Hex(written) !== digest) {
+  die("copied file does not match entry.png");
 }
-
-main();
+const shown = statSync(TARGET).size;
+console.log(`ok: entry.png ${shown} bytes sha256 ${digest} -> ${TARGET}`);
